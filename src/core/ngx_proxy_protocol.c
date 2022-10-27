@@ -96,6 +96,9 @@ static ngx_proxy_protocol_tlv_entry_t  ngx_proxy_protocol_tlv_ssl_entries[] = {
 };
 
 
+static const u_char pp_v2_signature[] = "\r\n\r\n\0\r\nQUIT\n";
+
+
 u_char *
 ngx_proxy_protocol_read(ngx_connection_t *c, u_char *buf, u_char *last)
 {
@@ -103,13 +106,11 @@ ngx_proxy_protocol_read(ngx_connection_t *c, u_char *buf, u_char *last)
     u_char                *p;
     ngx_proxy_protocol_t  *pp;
 
-    static const u_char signature[] = "\r\n\r\n\0\r\nQUIT\n";
-
     p = buf;
     len = last - buf;
 
     if (len >= sizeof(ngx_proxy_protocol_header_t)
-        && memcmp(p, signature, sizeof(signature) - 1) == 0)
+        && memcmp(p, pp_v2_signature, sizeof(pp_v2_signature) - 1) == 0)
     {
         return ngx_proxy_protocol_v2_read(c, buf, last);
     }
@@ -317,6 +318,124 @@ ngx_proxy_protocol_write(ngx_connection_t *c, u_char *buf, u_char *last)
     lport = ngx_inet_get_port(c->local_sockaddr);
 
     return ngx_slprintf(buf, last, " %ui %ui" CRLF, port, lport);
+}
+
+
+u_char *
+ngx_proxy_protocol_v2_write(ngx_connection_t *c, u_char *buf, u_char *last,
+                            ngx_array_t *tlvs, ngx_uint_t tlv_size)
+{
+    ngx_proxy_protocol_header_t        *header;
+    ngx_uint_t                          header_size;
+
+    ngx_proxy_protocol_inet_addrs_t    *in4;
+    struct sockaddr_in                 *sin;
+#if (NGX_HAVE_INET6)
+    ngx_proxy_protocol_inet6_addrs_t   *in6;
+    struct sockaddr_in6                *sin6;
+#endif
+
+    ngx_proxy_protocol_tlv_value_t     *tlv_c;
+    ng_proxy_protocol_tlv_block_t      *tlv;
+    u_short                             tlvlen;
+
+
+    if ((size_t) (last - buf) < sizeof(ngx_proxy_protocol_header_t)) {
+        return NULL;
+    }
+
+    if (ngx_connection_local_sockaddr(c, NULL, 0) != NGX_OK) {
+        return NULL;
+    }
+
+    header = (ngx_proxy_protocol_header_t *) buf;
+    header->version_command = 0x20 | 0x01; // v2 | PROXY command
+
+    ngx_memcpy(buf, pp_v2_signature, sizeof(pp_v2_signature) - 1);
+    buf += sizeof(ngx_proxy_protocol_header_t);
+
+    switch (c->sockaddr->sa_family) {
+
+    case AF_INET:
+        header_size = sizeof(ngx_proxy_protocol_inet_addrs_t) + tlv_size;
+
+        if ((size_t) (last - buf) < header_size) {
+            return NULL;
+        }
+
+        *(uint16_t*)header->len = htons(header_size);
+
+        header->family_transport = (NGX_PROXY_PROTOCOL_AF_INET << 4) | 0x01;
+
+        in4 = (ngx_proxy_protocol_inet_addrs_t *) buf;
+
+        sin = (struct sockaddr_in *)c->sockaddr;
+        ngx_memcpy(in4->src_addr, &sin->sin_addr, 4);
+        ngx_memcpy(in4->src_port, &sin->sin_port, 2);
+
+        sin = (struct sockaddr_in *)c->local_sockaddr;
+        ngx_memcpy(in4->dst_addr, &sin->sin_addr, 4);
+        ngx_memcpy(in4->dst_port, &sin->sin_port, 2);
+
+        buf += sizeof(ngx_proxy_protocol_inet_addrs_t);
+
+        break;
+
+#if (NGX_HAVE_INET6)
+    case AF_INET6:
+        header_size = sizeof(ngx_proxy_protocol_inet6_addrs_t) + tlv_size;
+
+        if ((size_t) (last - buf) < header_size) {
+            return NULL;
+        }
+
+        *(uint16_t*)header->len = htons(header_size);
+
+        header->family_transport = (NGX_PROXY_PROTOCOL_AF_INET6 << 4) | 0x01;
+
+        in6 = (ngx_proxy_protocol_inet6_addrs_t *) buf;
+
+        sin6 = (struct sockaddr_in6 *)c->sockaddr;
+        ngx_memcpy(in6->src_addr, &sin6->sin6_addr, 16);
+        ngx_memcpy(in6->src_port, &sin6->sin6_port, 2);
+
+        sin6 = (struct sockaddr_in6 *)c->local_sockaddr;
+        ngx_memcpy(in6->dst_addr, &sin6->sin6_addr, 16);
+        ngx_memcpy(in6->dst_port, &sin6->sin6_port, 2);
+
+        buf += sizeof(ngx_proxy_protocol_inet6_addrs_t);
+
+        break;
+#endif
+
+    default:
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, c->log, 0,
+                       "PROXY protocol v2 unsupported address family %ui",
+                       c->sockaddr->sa_family);
+        return NULL;
+
+    }
+
+    if (tlv_size != 0) {
+
+        tlv_c = (ngx_proxy_protocol_tlv_value_t*)tlvs->elts;
+
+        for (unsigned i = 0; i < tlvs->nelts; i++) {
+
+            tlvlen = tlv_c[i].value.len;
+
+            tlv = (ng_proxy_protocol_tlv_block_t *)buf;
+
+            tlv->type = tlv_c[i].type;
+            tlv->length_hi = (tlvlen >> 16) & 0xff;
+            tlv->length_lo = tlvlen & 0xff;
+            ngx_memcpy(tlv->value, tlv_c[i].value.data, tlvlen);
+
+            buf += 3 + tlvlen;
+        }
+    }
+
+    return buf;
 }
 
 
@@ -609,4 +728,39 @@ ngx_proxy_protocol_lookup_tlv(ngx_connection_t *c, ngx_str_t *tlvs,
     }
 
     return NGX_DECLINED;
+}
+
+ngx_int_t
+ngx_proxy_protocol_get_tlv_type(ngx_str_t *name)
+{
+    int                               n;
+    u_char                           *p;
+    ngx_proxy_protocol_tlv_entry_t   *pptlve;
+
+    n = name->len;
+    p = name->data;
+
+    if (n >= 3 && n <= 4 && p[0] == '0' && p[1] == 'x') {
+        return ngx_hextoi(p + 2, n - 2);
+    }
+
+    if (n > 4 && p[0] == 's' && p[1] == 's' && p[2] == 'l' && p[3] == '_') {
+
+        for (pptlve = ngx_proxy_protocol_tlv_ssl_entries;
+             pptlve->type != 0; pptlve++) {
+
+            if (ngx_strncmp(pptlve->name.data+4, name, pptlve->name.len-4)) {
+                return pptlve->type;
+            }
+        }
+    }
+
+    for (pptlve = ngx_proxy_protocol_tlv_entries; pptlve->type != 0; pptlve++) {
+
+        if (ngx_strncmp(pptlve->name.data, name, pptlve->name.len)) {
+            return pptlve->type;
+        }
+    }
+
+    return NGX_ERROR;
 }

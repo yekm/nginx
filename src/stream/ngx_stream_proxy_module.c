@@ -20,6 +20,12 @@ typedef struct {
 
 
 typedef struct {
+    ngx_int_t                        type;
+    ngx_stream_complex_value_t       cv;
+} ngx_stream_proxy_tlv_cv_t;
+
+
+typedef struct {
     ngx_msec_t                       connect_timeout;
     ngx_msec_t                       timeout;
     ngx_msec_t                       next_upstream_timeout;
@@ -31,6 +37,8 @@ typedef struct {
     ngx_uint_t                       next_upstream_tries;
     ngx_flag_t                       next_upstream;
     ngx_flag_t                       proxy_protocol;
+    ngx_uint_t                       proxy_protocol_version;
+    ngx_array_t                     *proxy_protocol_tlv;
     ngx_flag_t                       half_close;
     ngx_stream_upstream_local_t     *local;
     ngx_flag_t                       socket_keepalive;
@@ -63,6 +71,8 @@ typedef struct {
 static void ngx_stream_proxy_handler(ngx_stream_session_t *s);
 static ngx_int_t ngx_stream_proxy_eval(ngx_stream_session_t *s,
     ngx_stream_proxy_srv_conf_t *pscf);
+static ngx_int_t ngx_stream_proxy_eval_tlv(ngx_stream_session_t *s,
+    ngx_stream_proxy_srv_conf_t *pscf, ngx_array_t *tlv_v, size_t *size);
 static ngx_int_t ngx_stream_proxy_set_local(ngx_stream_session_t *s,
     ngx_stream_upstream_t *u, ngx_stream_upstream_local_t *local);
 static void ngx_stream_proxy_connect(ngx_stream_session_t *s);
@@ -89,6 +99,8 @@ static char *ngx_stream_proxy_merge_srv_conf(ngx_conf_t *cf, void *parent,
 static char *ngx_stream_proxy_pass(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_stream_proxy_bind(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_stream_proxy_protocol_tlv(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 
 #if (NGX_STREAM_SSL)
@@ -246,6 +258,20 @@ static ngx_command_t  ngx_stream_proxy_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_STREAM_SRV_CONF_OFFSET,
       offsetof(ngx_stream_proxy_srv_conf_t, proxy_protocol),
+      NULL },
+
+    { ngx_string("proxy_protocol_version"),
+      NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_proxy_srv_conf_t, proxy_protocol_version),
+      NULL },
+
+    { ngx_string("proxy_protocol_tlv"),
+      NGX_STREAM_MAIN_CONF|NGX_STREAM_SRV_CONF|NGX_CONF_TAKE2,
+      ngx_stream_proxy_protocol_tlv,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_stream_proxy_srv_conf_t, proxy_protocol_tlv),
       NULL },
 
     { ngx_string("proxy_half_close"),
@@ -642,6 +668,32 @@ ngx_stream_proxy_eval(ngx_stream_session_t *s,
 
 
 static ngx_int_t
+ngx_stream_proxy_eval_tlv(ngx_stream_session_t *s,
+    ngx_stream_proxy_srv_conf_t *pscf, ngx_array_t *tlv_v, size_t *size)
+{
+    ngx_stream_proxy_tlv_cv_t        *tlv_value;
+    ngx_proxy_protocol_tlv_value_t   *tlv;
+
+    tlv_value = pscf->proxy_protocol_tlv->elts;
+
+    for (unsigned i = 0; i < pscf->proxy_protocol_tlv->nelts; i++) {
+
+        tlv = ngx_array_push(tlv_v);
+
+        if (ngx_stream_complex_value(s, &tlv_value[i].cv,
+                                     &tlv->value) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        tlv->type = tlv_value[i].type;
+        *size += tlv->value.len;
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t
 ngx_stream_proxy_set_local(ngx_stream_session_t *s, ngx_stream_upstream_t *u,
     ngx_stream_upstream_local_t *local)
 {
@@ -785,6 +837,10 @@ ngx_stream_proxy_init_upstream(ngx_stream_session_t *s)
     ngx_stream_upstream_t        *u;
     ngx_stream_core_srv_conf_t   *cscf;
     ngx_stream_proxy_srv_conf_t  *pscf;
+    size_t                        pp_v2_header_size;
+    ngx_array_t                  *computed_tlvs;
+    size_t                        tlv_block_total_szie;
+    ngx_uint_t                    pp_v2_tlv_block_size;
 
     u = s->upstream;
     pc = u->peer.connection;
@@ -894,16 +950,67 @@ ngx_stream_proxy_init_upstream(ngx_stream_session_t *s)
             return;
         }
 
-        p = ngx_pnalloc(c->pool, NGX_PROXY_PROTOCOL_V1_MAX_HEADER);
-        if (p == NULL) {
-            ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
-            return;
+        if (pscf->proxy_protocol_version == 2) {
+
+            pp_v2_tlv_block_size = 0;
+
+            if (pscf->proxy_protocol_tlv) {
+
+                tlv_block_total_szie = 0;
+
+                computed_tlvs = ngx_array_create(
+                                       c->pool, pscf->proxy_protocol_tlv->nelts,
+                                       sizeof(ngx_proxy_protocol_tlv_value_t));
+                if (computed_tlvs == NULL) {
+                    ngx_stream_proxy_finalize(s,
+                                              NGX_STREAM_INTERNAL_SERVER_ERROR);
+                    return;
+                }
+
+                if (ngx_stream_proxy_eval_tlv(s, pscf, computed_tlvs,
+                                              &tlv_block_total_szie) != NGX_OK){
+                    ngx_stream_proxy_finalize(s,
+                                              NGX_STREAM_INTERNAL_SERVER_ERROR);
+                    return;
+                }
+
+                // 3 is the sizeof(ng_proxy_protocol_tlv_block_t) without .value
+                pp_v2_tlv_block_size = pscf->proxy_protocol_tlv->nelts * 3 +
+                                       tlv_block_total_szie;
+            }
+
+            // 16 is sizeof(ngx_proxy_protocol_header_t)
+            // sizeof(ngx_proxy_protocol_inet_addrs_t) is 12, not needed
+            // 36 is sizeof(ngx_proxy_protocol_inet6_addrs_t)
+            // TODO: support AF_UNIX with size 108+108
+            pp_v2_header_size = 16 + 36 + pp_v2_tlv_block_size;
+
+            p = ngx_pnalloc(c->pool, pp_v2_header_size);
+            if (p == NULL) {
+                ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+                return;
+            }
+
+            cl->buf->pos = p;
+
+            p = ngx_proxy_protocol_v2_write(c, p, p + pp_v2_header_size,
+                                            computed_tlvs,
+                                            pp_v2_tlv_block_size);
+
+        } else {
+
+            p = ngx_pnalloc(c->pool, NGX_PROXY_PROTOCOL_V1_MAX_HEADER);
+            if (p == NULL) {
+                ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
+                return;
+            }
+
+            cl->buf->pos = p;
+
+            p = ngx_proxy_protocol_write(c, p,
+                                         p + NGX_PROXY_PROTOCOL_V1_MAX_HEADER);
         }
 
-        cl->buf->pos = p;
-
-        p = ngx_proxy_protocol_write(c, p,
-                                     p + NGX_PROXY_PROTOCOL_V1_MAX_HEADER);
         if (p == NULL) {
             ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
             return;
@@ -2089,6 +2196,8 @@ ngx_stream_proxy_create_srv_conf(ngx_conf_t *cf)
     conf->next_upstream_tries = NGX_CONF_UNSET_UINT;
     conf->next_upstream = NGX_CONF_UNSET;
     conf->proxy_protocol = NGX_CONF_UNSET;
+    conf->proxy_protocol_version = NGX_CONF_UNSET;
+    conf->proxy_protocol_tlv = NGX_CONF_UNSET_PTR;
     conf->local = NGX_CONF_UNSET_PTR;
     conf->socket_keepalive = NGX_CONF_UNSET;
     conf->half_close = NGX_CONF_UNSET;
@@ -2144,6 +2253,12 @@ ngx_stream_proxy_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->next_upstream, prev->next_upstream, 1);
 
     ngx_conf_merge_value(conf->proxy_protocol, prev->proxy_protocol, 0);
+
+    ngx_conf_merge_uint_value(conf->proxy_protocol_version,
+                              prev->proxy_protocol_version, 1);
+
+    ngx_conf_merge_ptr_value(conf->proxy_protocol_tlv,
+                             prev->proxy_protocol_tlv, NULL);
 
     ngx_conf_merge_ptr_value(conf->local, prev->local, NULL);
 
@@ -2501,6 +2616,56 @@ ngx_stream_proxy_bind(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                                "invalid parameter \"%V\"", &value[2]);
             return NGX_CONF_ERROR;
         }
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+static char *
+ngx_stream_proxy_protocol_tlv(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_stream_proxy_srv_conf_t *pscf = conf;
+
+    ngx_stream_proxy_tlv_cv_t               *tlv_kv;
+    ngx_str_t                               *value, *tlv_name;
+    ngx_stream_complex_value_t              *cv;
+    ngx_stream_compile_complex_value_t       ccv;
+
+    value = cf->args->elts;
+
+    tlv_name = &value[1];
+
+    if (pscf->proxy_protocol_tlv == NGX_CONF_UNSET_PTR) {
+        pscf->proxy_protocol_tlv = ngx_array_create(cf->pool, 4,
+                                             sizeof(ngx_stream_proxy_tlv_cv_t));
+        if (pscf->proxy_protocol_tlv == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    tlv_kv = ngx_array_push(pscf->proxy_protocol_tlv);
+
+    tlv_kv->type = ngx_proxy_protocol_get_tlv_type(tlv_name);
+    if (tlv_kv->type == NGX_ERROR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid PROXY protocol TLV \"%V\"", tlv_name);
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(&ccv, sizeof(ngx_stream_compile_complex_value_t));
+
+    cv = ngx_palloc(cf->pool, sizeof(ngx_stream_complex_value_t));
+    if (cv == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    ccv.cf = cf;
+    ccv.value = &value[2];
+    ccv.complex_value = &tlv_kv->cv;
+
+    if (ngx_stream_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
     }
 
     return NGX_CONF_OK;
